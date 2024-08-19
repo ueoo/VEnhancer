@@ -5,6 +5,10 @@ import torch
 from .schedules_sdedit import karras_schedule
 from .solvers_sdedit import sample_dpmpp_2m_sde, sample_heun
 
+from video_to_video.utils.logger import get_logger
+
+logger = get_logger()
+
 __all__ = ['GaussianDiffusion']
 
 
@@ -107,6 +111,7 @@ class GaussianDiffusion(object):
                clamp=None,
                percentile=None,
                solver='euler_a',
+               solver_mode='fast',
                steps=20,
                t_max=None,
                t_min=None,
@@ -115,6 +120,7 @@ class GaussianDiffusion(object):
                return_intermediate=None,
                show_progress=False,
                seed=-1,
+               chunk_inds=None,
                **kwargs):
         # sanity check
         assert isinstance(steps, (int, torch.LongTensor))
@@ -157,6 +163,30 @@ class GaussianDiffusion(object):
                 intermediates.append(x0)
             return x0
 
+        mask_cond = model_kwargs[3]['mask_cond']
+        def model_tile_fn(xt, sigma):
+            # denoising
+            t = self._sigma_to_t(sigma).repeat(len(xt)).round().long()
+            O_F_NUM = chunk_inds[0][-1]-chunk_inds[1][0]+1
+            cut_f_ind = O_F_NUM//2
+
+            results_list = []
+            for i in range(len(chunk_inds)):
+                xt_chunk = xt[:,:,chunk_inds[i]].clone()
+                cur_f = len(chunk_inds[i])
+                model_kwargs[3]['mask_cond'] = mask_cond[:,chunk_inds[i]].clone()
+                x0_chunk = self.denoise(xt_chunk, t, None, model, model_kwargs, guide_scale,
+                              guide_rescale, clamp, percentile)[-2]
+                if i == 0:
+                    results_list.append(x0_chunk[:,:,:cur_f+cut_f_ind-O_F_NUM])
+                elif i == len(chunk_inds)-1:
+                    results_list.append(x0_chunk[:,:,cut_f_ind:])
+                else:
+                    results_list.append(x0_chunk[:,:,cut_f_ind:cur_f+cut_f_ind-O_F_NUM])
+            x0 = torch.concat(results_list, dim=2)
+            torch.cuda.empty_cache()
+            return x0
+
         # get timesteps
         if isinstance(steps, int):
             steps += 1 if discard_penultimate_step else 0
@@ -172,6 +202,13 @@ class GaussianDiffusion(object):
             elif discretization == 'trailing':
                 steps = torch.arange(t_max, t_min - 1,
                                      -((t_max - t_min + 1) / steps))
+                if solver_mode == 'fast':
+                    t_mid = 500
+                    steps1 = torch.arange(t_max, t_mid - 1,
+                                            -((t_max - t_mid + 1) / 4))
+                    steps2 = torch.arange(t_mid, t_min - 1,
+                                            -((t_mid - t_min + 1) / 11))
+                    steps = torch.concat([steps1, steps2])
             else:
                 raise NotImplementedError(
                     f'{discretization} discretization not implemented')
@@ -202,10 +239,10 @@ class GaussianDiffusion(object):
                 sigmas = torch.cat([sigmas, sigmas.new_zeros([1])])
         if discard_penultimate_step:
             sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])
-
-        # sampling
+        
+        fn = model_tile_fn if chunk_inds is not None else model_fn
         x0 = solver_fn(
-            noise, model_fn, sigmas, show_progress=show_progress, **kwargs)
+            noise, fn, sigmas, show_progress=show_progress, **kwargs)
         return (x0, intermediates) if return_intermediate is not None else x0
 
     def _sigma_to_t(self, sigma):

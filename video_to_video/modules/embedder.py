@@ -16,7 +16,7 @@ class FrozenOpenCLIPEmbedder(nn.Module):
     LAYERS = ['last', 'penultimate']
 
     def __init__(self,
-                 pretrained,
+                 pretrained='laion2b_s32b_b79k',
                  arch='ViT-H-14',
                  device='cuda',
                  max_length=77,
@@ -24,8 +24,7 @@ class FrozenOpenCLIPEmbedder(nn.Module):
                  layer='penultimate'):
         super().__init__()
         assert layer in self.LAYERS
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            arch, device=torch.device('cpu'), pretrained=pretrained)
+        model, _, _ = open_clip.create_model_and_transforms(arch, device=torch.device('cpu'), pretrained=pretrained)
 
         del model.visual
         self.model = model

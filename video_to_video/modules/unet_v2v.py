@@ -12,6 +12,7 @@ import xformers.ops
 from einops import rearrange
 from fairscale.nn.checkpoint import checkpoint_wrapper
 
+
 USE_TEMPORAL_TRANSFORMER = True
 
 
@@ -916,7 +917,7 @@ class TemporalTransformer(nn.Module):
                     inner_dim, in_channels, kernel_size=1, stride=1,
                     padding=0))
         else:
-            self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
+            self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
             if self.use_adaptor:
                 self.adaptor_out = nn.Linear(frames, frames)
         self.use_linear = use_linear
@@ -937,8 +938,10 @@ class TemporalTransformer(nn.Module):
         # [16384, 16, 320]
         if self.use_linear:
             x = rearrange(
-                x, '(b f) c h w -> b (h w) f c', f=self.frames).contiguous()
+                x, 'b c f h w -> (b h w) f c').contiguous()
             x = self.proj_in(x)
+            x = rearrange(
+                x, 'bhw f c -> bhw c f').contiguous()
 
         if self.only_self_att:
             x = rearrange(x, 'bhw c f -> bhw f c').contiguous()
@@ -961,8 +964,10 @@ class TemporalTransformer(nn.Module):
                     x[j] = block(x[j], context=context_i_j)
 
         if self.use_linear:
+            x = rearrange(x, 'b hw f c -> (b hw) f c').contiguous()
             x = self.proj_out(x)
-            x = rearrange(x, 'b (h w) f c -> b f c h w', h=h, w=w).contiguous()
+            x = rearrange(
+                x, '(b h w) f c -> b c f h w', b=b, h=h, w=w).contiguous()
         if not self.use_linear:
             x = rearrange(x, 'b hw f c -> (b hw) c f').contiguous()
             x = self.proj_out(x)
@@ -1551,7 +1556,7 @@ class ControlledV2VUNet(Vid2VidSDUNet):
                 y,
                 hint=None,
                 t_hint=None,
-                up_scale=None,
+                s_cond=None,
                 mask_cond=None,
                 x_lr=None,
                 fps=None,
@@ -1566,7 +1571,7 @@ class ControlledV2VUNet(Vid2VidSDUNet):
         self.batch = batch
         
         control = self.VideoControlNet(x, t, y, hint=hint, t_hint=t_hint, \
-                                                mask_cond=mask_cond, up_scale=up_scale)
+                                                mask_cond=mask_cond, s_cond=s_cond)
 
         # image and video joint training, if mask_last_frame_num is set, prob_focus_present will be ignored
         if mask_last_frame_num > 0:
@@ -1938,7 +1943,7 @@ class VideoControlNet(nn.Module):
                 x,
                 t,
                 y,
-                up_scale=None,
+                s_cond=None,
                 hint=None,
                 t_hint=None,
                 mask_cond=None,
@@ -1976,8 +1981,10 @@ class VideoControlNet(nn.Module):
             if mask_cond is not None:
                 for i in range(batch):
                     mask_cond_per_batch = mask_cond[i]
-                    inds = torch.where(mask_cond_per_batch == 0)[0]
-                    add[i,:,inds] += hints[i]
+                    inds = torch.where(mask_cond_per_batch >= 0)[0]
+                    hint_inds = mask_cond_per_batch[inds]
+                    add[i,:,inds] += hints[i,:,hint_inds]
+                    # add[i,:,inds] += hints[i]
             add = rearrange(add, 'b c f h w -> (b f) c h w')
 
         e = self.time_embed(sinusoidal_embedding(t, self.dim)) 
@@ -1989,20 +1996,20 @@ class VideoControlNet(nn.Module):
                 e = rearrange(e, '(b f) d -> b f d', b=batch)
                 for i in range(batch):
                     mask_cond_per_batch = mask_cond[i]
-                    inds = torch.where(mask_cond_per_batch == 0)[0]
+                    inds = torch.where(mask_cond_per_batch >= 0)[0]
                     e[i,inds] += e_cond[i]
                 e = rearrange(e, 'b f d -> (b f) d')
             else:
                 e_cond = e_cond.repeat_interleave(repeats=f, dim=0)
                 e += e_cond
         
-        if up_scale is not None:
-            e_scale = self.scale_cond(sinusoidal_embedding(up_scale, self.dim)) 
+        if s_cond is not None:
+            e_scale = self.scale_cond(sinusoidal_embedding(s_cond, self.dim)) 
             if mask_cond is not None:
                 e = rearrange(e, '(b f) d -> b f d', b=batch)
                 for i in range(batch):
                     mask_cond_per_batch = mask_cond[i]
-                    inds = torch.where(mask_cond_per_batch == 0)[0]
+                    inds = torch.where(mask_cond_per_batch >= 0)[0]
                     e[i,inds] += e_scale[i]
                 e = rearrange(e, 'b f d -> (b f) d')
             else:

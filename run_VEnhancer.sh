@@ -1,7 +1,8 @@
-python inference.py --cfg 7.5 --total_noise_levels 900 --steps 45 \
---model_path ckpts/venhancer_paper.pt \
---start_frame 0 --max_frame_num 48 \
---up_scale 4 --target_fps 24 --noise_aug 200 \
---input_path inputs/sample.mp4 \
---prompt 'Clown fish swimming through the coral reef.' \
---save_dir 'results/'
+export PATH=/mnt/petrelfs/share_data/hejingwen/ffmpeg-4.3.2-amd64-static/:$PATH
+srun -p video-aigc-1 --gres=gpu:1 --job-name=SRI  \
+python enhance_a_video.py \
+--up_scale 4 --target_fps 24 --noise_aug 250 \
+--solver_mode 'fast' --steps 15 \
+--input_path prompts/astronaut.mp4 \
+--prompt 'An astronaut flying in space, featuring a steady and smooth perspective' \
+--save_dir 'results/' \
