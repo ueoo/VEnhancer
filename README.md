@@ -77,23 +77,23 @@
 
 
 
-<!-- ## 🔥🔥 News
+## 🔥🔥 News
 We have enhanced some T2V results from [CogVideoX](https://github.com/THUDM/CogVideo)🤗. (This checkpoint is not the released one!) 
 <div align="center">
-  <video src="https://github.com/Vchitect/VEnhancer/assets/news/boat_input.mp4" width="80%" controls autoplay></video>
-  <video src="https://github.com/Vchitect/VEnhancer/assets/news/boat_up3.mp4" width="80%" controls autoplay></video>
+  <video src="https://github.com/user-attachments/assets/d6ba4ebe-a970-4db1-ade1-03bfa8e52a20" width="80%" controls autoplay></video>
+  <video src="https://github.com/user-attachments/assets/bf97116e-2fbc-4e29-b559-4fe08dc65c02" width="80%" controls autoplay></video>
   <p>A detailed wooden toy ship with intricately carved masts and sails is seen gliding smoothly over a plush, blue carpet that mimics the waves of the sea. The ship's hull is painted a rich brown, with tiny windows. The carpet, soft and textured, provides a perfect backdrop, resembling an oceanic expanse. Surrounding the ship are various other toys and children's items, hinting at a playful environment. The scene captures the innocence and imagination of childhood, with the toy ship's journey symbolizing endless adventures in a whimsical, indoor setting.</p>
 </div>
 
 <div align="center">
-  <video src="https://github.com/Vchitect/VEnhancer/assets/news/suv_input.mp4" width="80%" controls autoplay></video>
-  <video src="https://github.com/Vchitect/VEnhancer/assets/news/suv_up2.mp4" width="80%" controls autoplay></video>
+  <video src="https://github.com/user-attachments/assets/ff59dc10-b674-4ec5-ae7f-7c1ee3c638e1" width="80%" controls autoplay></video>
+  <video src="https://github.com/user-attachments/assets/faebf7bb-5a33-4cd5-84ca-768d384dfe94" width="80%" controls autoplay></video>
   <p>The camera follows behind a white vintage SUV with a black roof rack as it speeds up a steep dirt road surrounded by pine trees on a steep mountain slope, dust kicks up from its tires, the sunlight shines on the SUV as it speeds along the dirt road, casting a warm glow over the scene. The dirt road curves gently into the distance, with no other cars or vehicles in sight. The trees on either side of the road are redwoods, with patches of greenery scattered throughout. The car is seen from the rear following the curve with ease, making it seem as if it is on a rugged drive through the rugged terrain. The dirt road itself is surrounded by steep hills and mountains, with a clear blue sky above with wispy clouds.</p>
-</div> -->
+</div>
 
 
 ## 🔥 Update
-- [2024.08.18] 😸 Support enhancement for **abitrary long videos** (by spliting the videos into muliple chunks with overlaps). Fewer sampling steps (15) are enabled without obvious quality loss by setting `--solver_mode 'fast'` in the script command; Use **temporal VAE** to reduce video flickering.
+- [2024.08.18] 😸 Support enhancement for **abitrary long videos** (by spliting the videos into muliple chunks with overlaps); Fewer sampling steps (15) are enabled without obvious quality loss by setting `--solver_mode 'fast'` in the script command; Use **temporal VAE** to reduce video flickering.
 - [2024.07.28] 🔥 Inference code and pretrained video enhancement model are released.
 - [2024.07.10] 🤗 This repo is created.
 
