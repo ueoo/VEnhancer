@@ -78,7 +78,9 @@
 
 
 ## 🔥🔥 News
-We have enhanced some T2V results from [CogVideoX](https://github.com/THUDM/CogVideo)🤗. (This checkpoint is not the released one!) 
+We have enhanced some T2V results from [CogVideoX](https://github.com/THUDM/CogVideo)🤗. (This checkpoint is not the released one :cold_sweat:.) 
+
+Short captions (less than three sentences) are more suitable for VEnhancer. Please shorten the long captions when you are using VEnhancer.
 <div align="center">
   <video src="https://github.com/user-attachments/assets/d6ba4ebe-a970-4db1-ade1-03bfa8e52a20" width="80%" controls autoplay></video>
   <video src="https://github.com/user-attachments/assets/bf97116e-2fbc-4e29-b559-4fe08dc65c02" width="80%" controls autoplay></video>

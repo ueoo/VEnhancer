@@ -154,7 +154,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # venhancer = VEnhancer()
-    # video_path = venhancer.enhance_a_video('prompts/cat.mp4','A cat wearing sunglasses at a pool')
-    # print('done', video_path)
     main()
