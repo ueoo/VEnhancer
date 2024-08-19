@@ -77,19 +77,19 @@
 
 
 
-## 🔥🔥 News
+<!-- ## 🔥🔥 News
 We have enhanced some T2V results from [CogVideoX](https://github.com/THUDM/CogVideo)🤗. (This checkpoint is not the released one!) 
 <div align="center">
-  <video src="assets/news/boat_input.mp4" width="80%" controls autoplay></video>
-  <video src="assets/news/boat_up3.mp4" width="80%" controls autoplay></video>
+  <video src="https://github.com/Vchitect/VEnhancer/assets/news/boat_input.mp4" width="80%" controls autoplay></video>
+  <video src="https://github.com/Vchitect/VEnhancer/assets/news/boat_up3.mp4" width="80%" controls autoplay></video>
   <p>A detailed wooden toy ship with intricately carved masts and sails is seen gliding smoothly over a plush, blue carpet that mimics the waves of the sea. The ship's hull is painted a rich brown, with tiny windows. The carpet, soft and textured, provides a perfect backdrop, resembling an oceanic expanse. Surrounding the ship are various other toys and children's items, hinting at a playful environment. The scene captures the innocence and imagination of childhood, with the toy ship's journey symbolizing endless adventures in a whimsical, indoor setting.</p>
 </div>
 
 <div align="center">
-  <video src="assets/news/suv_input.mp4" width="80%" controls autoplay></video>
-  <video src="assets/news/suv_up2.mp4" width="80%" controls autoplay></video>
+  <video src="https://github.com/Vchitect/VEnhancer/assets/news/suv_input.mp4" width="80%" controls autoplay></video>
+  <video src="https://github.com/Vchitect/VEnhancer/assets/news/suv_up2.mp4" width="80%" controls autoplay></video>
   <p>The camera follows behind a white vintage SUV with a black roof rack as it speeds up a steep dirt road surrounded by pine trees on a steep mountain slope, dust kicks up from its tires, the sunlight shines on the SUV as it speeds along the dirt road, casting a warm glow over the scene. The dirt road curves gently into the distance, with no other cars or vehicles in sight. The trees on either side of the road are redwoods, with patches of greenery scattered throughout. The car is seen from the rear following the curve with ease, making it seem as if it is on a rugged drive through the rugged terrain. The dirt road itself is surrounded by steep hills and mountains, with a clear blue sky above with wispy clouds.</p>
-</div>
+</div> -->
 
 
 ## 🔥 Update
@@ -101,7 +101,7 @@ We have enhanced some T2V results from [CogVideoX](https://github.com/THUDM/CogV
 VEnhancer achieves spatial super-resolution, temporal super-resolution (frame interpolation), and video refinement in a **unified framework**.
 It is flexible to adapt to different upsampling factors (e.g., 1x~8x) for either spatial or temporal super-resolution. Besides, it provides flexible control to modify the refinement strength for handling diversified video artifacts. 
 
-It follows ControlNet and copies the architecures and weights of multi-frame  encoder and middle block of a pretrained video diffusion model to build a trainable condition network. 
+It follows ControlNet and copies the architecures and weights of multi-frame encoder and middle block of a pretrained video diffusion model to build a trainable condition network. 
 This **video ControlNet** accepts both low-resolution key frames and full frames of noisy latents as inputs. 
 Also, the noise level $\sigma$ regarding noise augmentation and downscaling factor $s$ serve as additional network conditioning through our proposed **video-aware conditioning** apart from timestep $t$ and prompt $c_{text}$. 
 ![overall_structure](assets/venhancer_arch.png)
@@ -135,7 +135,7 @@ sudo apt-get update && apt-get install ffmpeg libsm6 libxext6  -y
 ```bash
   bash run_VEnhancer.sh
 ```
-In `run_VEnhancer.sh`, `up_scale` is the upsampling factor (1~8) for spatial super-resolution; `target_fps` is your expected target fps (default is 24); `noise_aug` is the noise level (0~300) regarding noise augmentation. 
+In `run_VEnhancer.sh`, `up_scale` is the upsampling factor ($1\sim8$) for spatial super-resolution; `target_fps` is your expected target fps (default is 24); `noise_aug` is the noise level ($0\sim300$) regarding noise augmentation. 
 
 ### Gradio
 The same functionality is also available as a gradio demo
