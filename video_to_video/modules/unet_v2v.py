@@ -1569,7 +1569,7 @@ class ControlledV2VUNet(Vid2VidSDUNet):
         batch, c, f, h, w= x.shape
         device = x.device
         self.batch = batch
-        
+
         control = self.VideoControlNet(x, t, y, hint=hint, t_hint=t_hint, \
                                                 mask_cond=mask_cond, s_cond=s_cond)
 

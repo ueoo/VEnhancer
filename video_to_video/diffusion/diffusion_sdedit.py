@@ -164,25 +164,26 @@ class GaussianDiffusion(object):
             return x0
 
         mask_cond = model_kwargs[3]['mask_cond']
-        def model_tile_fn(xt, sigma):
+        def model_chunk_fn(xt, sigma):
             # denoising
             t = self._sigma_to_t(sigma).repeat(len(xt)).round().long()
-            O_F_NUM = chunk_inds[0][-1]-chunk_inds[1][0]+1
-            cut_f_ind = O_F_NUM//2
+            O_LEN = chunk_inds[0][-1]-chunk_inds[1][0]
+            cut_f_ind = O_LEN//2
 
             results_list = []
             for i in range(len(chunk_inds)):
-                xt_chunk = xt[:,:,chunk_inds[i]].clone()
-                cur_f = len(chunk_inds[i])
-                model_kwargs[3]['mask_cond'] = mask_cond[:,chunk_inds[i]].clone()
+                ind_start, ind_end = chunk_inds[i]
+                xt_chunk = xt[:,:,ind_start:ind_end].clone()
+                cur_f = xt_chunk.size(2)
+                model_kwargs[3]['mask_cond'] = mask_cond[:,ind_start:ind_end].clone()
                 x0_chunk = self.denoise(xt_chunk, t, None, model, model_kwargs, guide_scale,
                               guide_rescale, clamp, percentile)[-2]
                 if i == 0:
-                    results_list.append(x0_chunk[:,:,:cur_f+cut_f_ind-O_F_NUM])
+                    results_list.append(x0_chunk[:,:,:cur_f+cut_f_ind-O_LEN])
                 elif i == len(chunk_inds)-1:
                     results_list.append(x0_chunk[:,:,cut_f_ind:])
                 else:
-                    results_list.append(x0_chunk[:,:,cut_f_ind:cur_f+cut_f_ind-O_F_NUM])
+                    results_list.append(x0_chunk[:,:,cut_f_ind:cur_f+cut_f_ind-O_LEN])
             x0 = torch.concat(results_list, dim=2)
             torch.cuda.empty_cache()
             return x0
@@ -240,7 +241,7 @@ class GaussianDiffusion(object):
         if discard_penultimate_step:
             sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])
         
-        fn = model_tile_fn if chunk_inds is not None else model_fn
+        fn = model_chunk_fn if chunk_inds is not None else model_fn
         x0 = solver_fn(
             noise, fn, sigmas, show_progress=show_progress, **kwargs)
         return (x0, intermediates) if return_intermediate is not None else x0

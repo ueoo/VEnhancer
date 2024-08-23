@@ -99,8 +99,7 @@ class VideoToVideo():
         mask_cond = mask_cond.unsqueeze(0).to(self.device)
         s_cond = torch.LongTensor([s_cond]).to(self.device)
 
-        video_data_feature = tensor2latent(video_data, self.vae)
-
+        video_data_feature = self.vae_encode(video_data)
         torch.cuda.empty_cache()
 
         y = self.clip_encoder(y).detach() 
@@ -139,7 +138,9 @@ class VideoToVideo():
                 chunk_inds=chunk_inds)
             torch.cuda.empty_cache()
 
-            vid_tensor_gen = latent2tensor(gen_vid, self.vae)
+            logger.info(f'sampling, finished.')
+            vid_tensor_gen = self.vae_decode_chunk(gen_vid)
+            logger.info(f'temporal vae decoding, finished.')
 
         w1, w2, h1, h2 = padding
         vid_tensor_gen = vid_tensor_gen[:,:,h1:h+h1,w1:w+w1]
@@ -147,10 +148,31 @@ class VideoToVideo():
         gen_video = rearrange(
             vid_tensor_gen, '(b f) c h w -> b c f h w', b=bs)
 
-        logger.info(f'sampling, finished.')
         torch.cuda.empty_cache()
         
         return gen_video.type(torch.float32).cpu()
+
+    def temporal_vae_decode(self, z, num_f):
+        return self.vae.decode(z/self.vae.config.scaling_factor, num_frames=num_f).sample
+
+    def vae_decode_chunk(self, z, chunk_size=3):
+        z = rearrange(z, "b c f h w -> (b f) c h w")
+        video = []
+        for ind in range(0, z.shape[0], chunk_size):
+            num_f = z[ind:ind+chunk_size].shape[0]
+            video.append(self.temporal_vae_decode(z[ind:ind+chunk_size],num_f))
+        video = torch.cat(video)
+        return video
+
+    def vae_encode(self, t, chunk_size=1):
+        num_f = t.shape[1]
+        t = rearrange(t, "b f c h w -> (b f) c h w")
+        z_list = []
+        for ind in range(0,t.shape[0],chunk_size):
+            z_list.append(self.vae.encode(t[ind:ind+chunk_size]).latent_dist.sample())
+        z = torch.cat(z_list, dim=0)
+        z = rearrange(z, "(b f) c h w -> b c f h w", f=num_f)
+        return z * self.vae.config.scaling_factor
 
 
 def pad_to_fit(h, w):
@@ -179,43 +201,24 @@ def _create_pad(h, max_len):
     return h1, h2
 
 
-def make_chunks(f_num, interp_f_num):
-    MAX_CHUNK_LEN, MAX_O_LEN, MIN_S_NUM = 24, 12, 8
-    chunk_len = (MAX_CHUNK_LEN-1)//(1+interp_f_num)*(interp_f_num+1)+1
-    o_len = (MAX_O_LEN-1)//(1+interp_f_num)*(interp_f_num+1)+1
-    ind = 0
-    chunk_inds = []
-    while ind<f_num:
-        if ind+chunk_len+MIN_S_NUM>=f_num:
-            chunk_inds.append(list(range(ind,f_num)))
-            break
-        else:
-            chunk_inds.append(list(range(ind,ind+chunk_len)))
-            ind += chunk_len-o_len  
+def make_chunks(f_num, interp_f_num, chunk_overlap_ratio=0.5):
+    MAX_CHUNK_LEN = 24
+    MAX_O_LEN = MAX_CHUNK_LEN * chunk_overlap_ratio
+    chunk_len = int((MAX_CHUNK_LEN-1)//(1+interp_f_num)*(interp_f_num+1)+1)
+    o_len = int((MAX_O_LEN-1)//(1+interp_f_num)*(interp_f_num+1)+1)
+    chunk_inds = sliding_windows_1d(f_num, chunk_len, o_len)
     return chunk_inds
 
 
-def tensor2latent(t, vae):
-    video_length = t.shape[1]
-    t = rearrange(t, "b f c h w -> (b f) c h w")
-    chunk_size = 1
-    latents_list = []
-    for ind in range(0,t.shape[0],chunk_size):
-        latents_list.append(vae.encode(t[ind:ind+chunk_size]).latent_dist.sample())
-    latents = torch.cat(latents_list, dim=0)
-    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
-    latents = latents * vae.config.scaling_factor
-    return latents
-
-
-def latent2tensor(latents, vae):
-    video_length = latents.shape[2]
-    latents = 1. / vae.config.scaling_factor * latents
-    latents = rearrange(latents, "b c f h w -> (b f) c h w")
-    video = []
-    chunk_size = 3
-    for ind in range(0, latents.shape[0], chunk_size):
-        num_frames = latents[ind:ind+chunk_size].shape[0]
-        video.append(vae.decode(latents[ind:ind+chunk_size], num_frames=num_frames).sample)
-    video = torch.cat(video)
-    return video
+def sliding_windows_1d(length, window_size, overlap_size):
+    stride = window_size - overlap_size
+    ind = 0
+    coords = []
+    while ind<length:
+        if ind+window_size*1.25>=length:
+            coords.append((ind,length))
+            break
+        else:
+            coords.append((ind,ind+window_size))
+            ind += stride  
+    return coords
