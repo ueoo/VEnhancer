@@ -2,23 +2,52 @@
 
 import math
 import os
+
 from abc import abstractmethod
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import xformers
 import xformers.ops
-from einops import rearrange
+
+from einops import rearrange, repeat
 from fairscale.nn.checkpoint import checkpoint_wrapper
+from torch.utils.checkpoint import checkpoint
 
 
 USE_TEMPORAL_TRANSFORMER = True
 
 
-class DropPath(nn.Module):
-    r"""DropPath but without rescaling and supports optional all-zero and/or all-keep.
+def conv_nd(dims, *args, **kwargs):
     """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+class DropPath(nn.Module):
+    r"""DropPath but without rescaling and supports optional all-zero and/or all-keep."""
 
     def __init__(self, p):
         super(DropPath, self).__init__()
@@ -54,7 +83,7 @@ class DropPath(nn.Module):
 
     def broadcast(self, src, dst):
         assert src.size(0) == dst.size(0)
-        shape = (dst.size(0), ) + (1, ) * (dst.ndim - 1)
+        shape = (dst.size(0),) + (1,) * (dst.ndim - 1)
         return src.view(shape)
 
 
@@ -64,9 +93,7 @@ def sinusoidal_embedding(timesteps, dim):
     timesteps = timesteps.float()
 
     # compute sinusoidal embedding
-    sinusoid = torch.outer(
-        timesteps, torch.pow(10000,
-                             -torch.arange(half).to(timesteps).div(half)))
+    sinusoid = torch.outer(timesteps, torch.pow(10000, -torch.arange(half).to(timesteps).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     if dim % 2 != 0:
         x = torch.cat([x, torch.zeros_like(x[:, :1])], dim=1)
@@ -98,13 +125,7 @@ def prob_mask_like(shape, prob, device):
 
 class MemoryEfficientCrossAttention(nn.Module):
 
-    def __init__(self,
-                 query_dim,
-                 context_dim=None,
-                 heads=8,
-                 dim_head=64,
-                 max_bs=16384,
-                 dropout=0.0):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, max_bs=16384, dropout=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -116,8 +137,7 @@ class MemoryEfficientCrossAttention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
         self.attention_op: Optional[Any] = None
 
     def forward(self, x, context=None, mask=None):
@@ -128,9 +148,11 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         b, _, _ = q.shape
         q, k, v = map(
-            lambda t: t.unsqueeze(3).reshape(b, t.shape[
-                1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(
-                    b * self.heads, t.shape[1], self.dim_head).contiguous(),
+            lambda t: t.unsqueeze(3)
+            .reshape(b, t.shape[1], self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b * self.heads, t.shape[1], self.dim_head)
+            .contiguous(),
             (q, k, v),
         )
 
@@ -141,22 +163,20 @@ class MemoryEfficientCrossAttention(nn.Module):
             v_list = torch.chunk(v, v.shape[0] // self.max_bs, dim=0)
             out_list = []
             for q_1, k_1, v_1 in zip(q_list, k_list, v_list):
-                out = xformers.ops.memory_efficient_attention(
-                    q_1, k_1, v_1, attn_bias=None, op=self.attention_op)
+                out = xformers.ops.memory_efficient_attention(q_1, k_1, v_1, attn_bias=None, op=self.attention_op)
                 out_list.append(out)
             out = torch.cat(out_list, dim=0)
         else:
-            out = xformers.ops.memory_efficient_attention(
-                q, k, v, attn_bias=None, op=self.attention_op)
+            out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
 
         if exists(mask):
             raise NotImplementedError
         out = (
-            out.unsqueeze(0).reshape(
-                b, self.heads, out.shape[1],
-                self.dim_head).permute(0, 2, 1,
-                                       3).reshape(b, out.shape[1],
-                                                  self.heads * self.dim_head))
+            out.unsqueeze(0)
+            .reshape(b, self.heads, out.shape[1], self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b, out.shape[1], self.heads * self.dim_head)
+        )
         return self.to_out(out)
 
 
@@ -169,9 +189,7 @@ class RelativePositionBias(nn.Module):
         self.relative_attention_bias = nn.Embedding(num_buckets, heads)
 
     @staticmethod
-    def _relative_position_bucket(relative_position,
-                                  num_buckets=32,
-                                  max_distance=128):
+    def _relative_position_bucket(relative_position, num_buckets=32, max_distance=128):
         ret = 0
         n = -relative_position
 
@@ -182,12 +200,15 @@ class RelativePositionBias(nn.Module):
         max_exact = num_buckets // 2
         is_small = n < max_exact
 
-        val_if_large = max_exact + (
-            torch.log(n.float() / max_exact)
-            / math.log(max_distance / max_exact) *  # noqa
-            (num_buckets - max_exact)).long()
-        val_if_large = torch.min(
-            val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+        val_if_large = (
+            max_exact
+            + (
+                torch.log(n.float() / max_exact)
+                / math.log(max_distance / max_exact)  # noqa
+                * (num_buckets - max_exact)
+            ).long()
+        )
+        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
 
         ret += torch.where(is_small, n, val_if_large)
         return ret
@@ -195,13 +216,12 @@ class RelativePositionBias(nn.Module):
     def forward(self, n, device):
         q_pos = torch.arange(n, dtype=torch.long, device=device)
         k_pos = torch.arange(n, dtype=torch.long, device=device)
-        rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
+        rel_pos = rearrange(k_pos, "j -> 1 j") - rearrange(q_pos, "i -> i 1")
         rp_bucket = self._relative_position_bucket(
-            rel_pos,
-            num_buckets=self.num_buckets,
-            max_distance=self.max_distance)
+            rel_pos, num_buckets=self.num_buckets, max_distance=self.max_distance
+        )
         values = self.relative_attention_bias(rp_bucket)
-        return rearrange(values, 'i j h -> h i j')
+        return rearrange(values, "i j h -> h i j")
 
 
 class SpatialTransformer(nn.Module):
@@ -214,44 +234,45 @@ class SpatialTransformer(nn.Module):
     NEW: use_linear for more efficiency instead of the 1x1 convs
     """
 
-    def __init__(self,
-                 in_channels,
-                 n_heads,
-                 d_head,
-                 depth=1,
-                 dropout=0.,
-                 context_dim=None,
-                 disable_self_attn=False,
-                 use_linear=False,
-                 use_checkpoint=True):
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.0,
+        context_dim=None,
+        disable_self_attn=False,
+        use_linear=False,
+        use_checkpoint=True,
+    ):
         super().__init__()
         if exists(context_dim) and not isinstance(context_dim, list):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = torch.nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         if not use_linear:
-            self.proj_in = nn.Conv2d(
-                in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
+            self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
         else:
             self.proj_in = nn.Linear(in_channels, inner_dim)
 
-        self.transformer_blocks = nn.ModuleList([
-            BasicTransformerBlock(
-                inner_dim,
-                n_heads,
-                d_head,
-                dropout=dropout,
-                context_dim=context_dim[d],
-                disable_self_attn=disable_self_attn,
-                checkpoint=use_checkpoint) for d in range(depth)
-        ])
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock(
+                    inner_dim,
+                    n_heads,
+                    d_head,
+                    dropout=dropout,
+                    context_dim=context_dim[d],
+                    disable_self_attn=disable_self_attn,
+                    checkpoint=use_checkpoint,
+                )
+                for d in range(depth)
+            ]
+        )
         if not use_linear:
-            self.proj_out = zero_module(
-                nn.Conv2d(
-                    inner_dim, in_channels, kernel_size=1, stride=1,
-                    padding=0))
+            self.proj_out = zero_module(nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0))
         else:
             self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
         self.use_linear = use_linear
@@ -265,30 +286,25 @@ class SpatialTransformer(nn.Module):
         x = self.norm(x)
         if not self.use_linear:
             x = self.proj_in(x)
-        x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+        x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         if self.use_linear:
             x = self.proj_in(x)
         for i, block in enumerate(self.transformer_blocks):
             x = block(x, context=context[i])
         if self.use_linear:
             x = self.proj_out(x)
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
         if not self.use_linear:
             x = self.proj_out(x)
         return x + x_in
 
 
-_ATTN_PRECISION = os.environ.get('ATTN_PRECISION', 'fp32')
+_ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
 
 class CrossAttention(nn.Module):
 
-    def __init__(self,
-                 query_dim,
-                 context_dim=None,
-                 heads=8,
-                 dim_head=64,
-                 dropout=0.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -300,8 +316,7 @@ class CrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
@@ -311,44 +326,45 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
-                      (q, k, v))
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
 
         # force cast to fp32 to avoid overflowing
-        if _ATTN_PRECISION == 'fp32':
-            with torch.autocast(enabled=False, device_type='cuda'):
+        if _ATTN_PRECISION == "fp32":
+            with torch.autocast(enabled=False, device_type="cuda"):
                 q, k = q.float(), k.float()
-                sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
+                sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
         else:
-            sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
+            sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
 
         del q, k
 
         if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
+            mask = rearrange(mask, "b ... -> b (...)")
             max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            mask = repeat(mask, "b j -> (b h) () j", h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
         sim = sim.softmax(dim=-1)
 
-        out = torch.einsum('b i j, b j d -> b i d', sim, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        out = torch.einsum("b i j, b j d -> b i d", sim, v)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
         return self.to_out(out)
 
 
 class BasicTransformerBlock(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 n_heads,
-                 d_head,
-                 dropout=0.,
-                 context_dim=None,
-                 gated_ff=True,
-                 checkpoint=True,
-                 disable_self_attn=False):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        dropout=0.0,
+        context_dim=None,
+        gated_ff=True,
+        checkpoint=True,
+        disable_self_attn=False,
+    ):
         super().__init__()
         attn_cls = MemoryEfficientCrossAttention
         self.disable_self_attn = disable_self_attn
@@ -357,30 +373,23 @@ class BasicTransformerBlock(nn.Module):
             heads=n_heads,
             dim_head=d_head,
             dropout=dropout,
-            context_dim=context_dim if self.disable_self_attn else None)
+            context_dim=context_dim if self.disable_self_attn else None,
+        )
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
 
         attn_cls2 = MemoryEfficientCrossAttention
-            
-        self.attn2 = attn_cls2(
-            query_dim=dim,
-            context_dim=context_dim,
-            heads=n_heads,
-            dim_head=d_head,
-            dropout=dropout)
+
+        self.attn2 = attn_cls2(query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
     def forward_(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(),
-                          self.checkpoint)
+        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
     def forward(self, x, context=None):
-        x = self.attn1(
-            self.norm1(x),
-            context=context if self.disable_self_attn else None) + x
+        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
@@ -409,15 +418,13 @@ def zero_module(module):
 
 class FeedForward(nn.Module):
 
-    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.0):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
-        project_in = nn.Sequential(nn.Linear(
-            dim, inner_dim), nn.GELU()) if not glu else GEGLU(dim, inner_dim)
+        project_in = nn.Sequential(nn.Linear(dim, inner_dim), nn.GELU()) if not glu else GEGLU(dim, inner_dim)
 
-        self.net = nn.Sequential(project_in, nn.Dropout(dropout),
-                                 nn.Linear(inner_dim, dim_out))
+        self.net = nn.Sequential(project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out))
 
     def forward(self, x):
         return self.net(x)
@@ -432,29 +439,21 @@ class Upsample(nn.Module):
                  upsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self,
-                 channels,
-                 use_conv,
-                 dims=2,
-                 out_channels=None,
-                 padding=1):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
         self.dims = dims
         if use_conv:
-            self.conv = nn.Conv2d(
-                self.channels, self.out_channels, 3, padding=padding)
+            self.conv = nn.Conv2d(self.channels, self.out_channels, 3, padding=padding)
 
     def forward(self, x):
         assert x.shape[1] == self.channels
         if self.dims == 3:
-            x = F.interpolate(
-                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2),
-                mode='nearest')
+            x = F.interpolate(x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest")
         else:
-            x = F.interpolate(x, scale_factor=2, mode='nearest')
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
             x = x[..., 1:-1, :]
         if self.use_conv:
             x = self.conv(x)
@@ -521,32 +520,27 @@ class ResBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(
                 emb_channels,
-                2 * self.out_channels
-                if use_scale_shift_norm else self.out_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
             ),
         )
         self.out_layers = nn.Sequential(
             nn.GroupNorm(32, self.out_channels),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            zero_module(
-                nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1)),
+            zero_module(nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1)),
         )
 
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
-            self.skip_connection = conv_nd(
-                dims, channels, self.out_channels, 3, padding=1)
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 3, padding=1)
         else:
             self.skip_connection = nn.Conv2d(channels, self.out_channels, 1)
 
         if self.use_temporal_conv:
             self.temopral_conv = TemporalConvBlock_v2(
-                self.out_channels,
-                self.out_channels,
-                dropout=0.1,
-                use_image_dataset=use_image_dataset)
+                self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset
+            )
 
     def forward(self, x, emb, batch_size):
         """
@@ -571,7 +565,7 @@ class ResBlock(nn.Module):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-            scale, shift = th.chunk(emb_out, 2, dim=1)
+            scale, shift = torch.chunk(emb_out, 2, dim=1)
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
@@ -580,9 +574,9 @@ class ResBlock(nn.Module):
         h = self.skip_connection(x) + h
 
         if self.use_temporal_conv:
-            h = rearrange(h, '(b f) c h w -> b c f h w', b=batch_size)
+            h = rearrange(h, "(b f) c h w -> b c f h w", b=batch_size)
             h = self.temopral_conv(h)
-            h = rearrange(h, 'b c f h w -> (b f) c h w')
+            h = rearrange(h, "b c f h w -> (b f) c h w")
         return h
 
 
@@ -595,12 +589,7 @@ class Downsample(nn.Module):
                  downsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self,
-                 channels,
-                 use_conv,
-                 dims=2,
-                 out_channels=None,
-                 padding=(2, 1)):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=(2, 1)):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
@@ -608,12 +597,7 @@ class Downsample(nn.Module):
         self.dims = dims
         stride = 2 if dims != 3 else (1, 2, 2)
         if use_conv:
-            self.op = nn.Conv2d(
-                self.channels,
-                self.out_channels,
-                3,
-                stride=stride,
-                padding=padding)
+            self.op = nn.Conv2d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
         else:
             assert self.channels == self.out_channels
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
@@ -626,31 +610,24 @@ class Downsample(nn.Module):
 class Resample(nn.Module):
 
     def __init__(self, in_dim, out_dim, mode):
-        assert mode in ['none', 'upsample', 'downsample']
+        assert mode in ["none", "upsample", "downsample"]
         super(Resample, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.mode = mode
 
     def forward(self, x, reference=None):
-        if self.mode == 'upsample':
+        if self.mode == "upsample":
             assert reference is not None
-            x = F.interpolate(x, size=reference.shape[-2:], mode='nearest')
-        elif self.mode == 'downsample':
-            x = F.adaptive_avg_pool2d(
-                x, output_size=tuple(u // 2 for u in x.shape[-2:]))
+            x = F.interpolate(x, size=reference.shape[-2:], mode="nearest")
+        elif self.mode == "downsample":
+            x = F.adaptive_avg_pool2d(x, output_size=tuple(u // 2 for u in x.shape[-2:]))
         return x
 
 
 class ResidualBlock(nn.Module):
 
-    def __init__(self,
-                 in_dim,
-                 embed_dim,
-                 out_dim,
-                 use_scale_shift_norm=True,
-                 mode='none',
-                 dropout=0.0):
+    def __init__(self, in_dim, embed_dim, out_dim, use_scale_shift_norm=True, mode="none", dropout=0.0):
         super(ResidualBlock, self).__init__()
         self.in_dim = in_dim
         self.embed_dim = embed_dim
@@ -659,19 +636,15 @@ class ResidualBlock(nn.Module):
         self.mode = mode
 
         # layers
-        self.layer1 = nn.Sequential(
-            nn.GroupNorm(32, in_dim), nn.SiLU(),
-            nn.Conv2d(in_dim, out_dim, 3, padding=1))
+        self.layer1 = nn.Sequential(nn.GroupNorm(32, in_dim), nn.SiLU(), nn.Conv2d(in_dim, out_dim, 3, padding=1))
         self.resample = Resample(in_dim, in_dim, mode)
         self.embedding = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(embed_dim,
-                      out_dim * 2 if use_scale_shift_norm else out_dim))
+            nn.SiLU(), nn.Linear(embed_dim, out_dim * 2 if use_scale_shift_norm else out_dim)
+        )
         self.layer2 = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout),
-            nn.Conv2d(out_dim, out_dim, 3, padding=1))
-        self.shortcut = nn.Identity() if in_dim == out_dim else nn.Conv2d(
-            in_dim, out_dim, 1)
+            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout), nn.Conv2d(out_dim, out_dim, 3, padding=1)
+        )
+        self.shortcut = nn.Identity() if in_dim == out_dim else nn.Conv2d(in_dim, out_dim, 1)
 
         # zero out the last layer params
         nn.init.zeros_(self.layer2[-1].weight)
@@ -717,7 +690,7 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x, context=None):
         r"""x:       [B, C, H, W].
-            context: [B, L, C] or None.
+        context: [B, L, C] or None.
         """
         identity = x
         b, c, h, w, n, d = *x.size(), self.num_heads, self.head_dim
@@ -726,10 +699,7 @@ class AttentionBlock(nn.Module):
         x = self.norm(x)
         q, k, v = self.to_qkv(x).view(b, n * 3, d, h * w).chunk(3, dim=1)
         if context is not None:
-            ck, cv = self.context_kv(context).reshape(b, -1, n * 2,
-                                                      d).permute(0, 2, 3,
-                                                                 1).chunk(
-                                                                     2, dim=1)
+            ck, cv = self.context_kv(context).reshape(b, -1, n * 2, d).permute(0, 2, 3, 1).chunk(2, dim=1)
             k = torch.cat([ck, k], dim=-1)
             v = torch.cat([cv, v], dim=-1)
 
@@ -748,13 +718,7 @@ class AttentionBlock(nn.Module):
 
 class TemporalAttentionBlock(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 heads=4,
-                 dim_head=32,
-                 rotary_emb=None,
-                 use_image_dataset=False,
-                 use_sim_mask=False):
+    def __init__(self, dim, heads=4, dim_head=32, rotary_emb=None, use_image_dataset=False, use_sim_mask=False):
         super().__init__()
         # consider num_heads first, as pos_bias needs fixed num_heads
         dim_head = dim // heads
@@ -771,17 +735,13 @@ class TemporalAttentionBlock(nn.Module):
         self.to_qkv = nn.Linear(dim, hidden_dim * 3)
         self.to_out = nn.Linear(hidden_dim, dim)
 
-    def forward(self,
-                x,
-                pos_bias=None,
-                focus_present_mask=None,
-                video_mask=None):
+    def forward(self, x, pos_bias=None, focus_present_mask=None, video_mask=None):
 
         identity = x
         n, height, device = x.shape[2], x.shape[-2], x.device
 
         x = self.norm(x)
-        x = rearrange(x, 'b c f h w -> b (h w) f c')
+        x = rearrange(x, "b c f h w -> b (h w) f c")
 
         qkv = self.to_qkv(x).chunk(3, dim=-1)
 
@@ -790,14 +750,14 @@ class TemporalAttentionBlock(nn.Module):
             # it would be equivalent to passing that token's values （v=qkv[-1]） through to the output
             values = qkv[-1]
             out = self.to_out(values)
-            out = rearrange(out, 'b (h w) f c -> b c f h w', h=height)
+            out = rearrange(out, "b (h w) f c -> b c f h w", h=height)
 
             return out + identity
 
         # split out heads
-        q = rearrange(qkv[0], '... n (h d) -> ... h n d', h=self.heads)
-        k = rearrange(qkv[1], '... n (h d) -> ... h n d', h=self.heads)
-        v = rearrange(qkv[2], '... n (h d) -> ... h n d', h=self.heads)
+        q = rearrange(qkv[0], "... n (h d) -> ... h n d", h=self.heads)
+        k = rearrange(qkv[1], "... n (h d) -> ... h n d", h=self.heads)
+        v = rearrange(qkv[2], "... n (h d) -> ... h n d", h=self.heads)
 
         # scale
 
@@ -810,36 +770,32 @@ class TemporalAttentionBlock(nn.Module):
 
         # similarity
         # shape [b (hw) h n n], n=f
-        sim = torch.einsum('... h i d, ... h j d -> ... h i j', q, k)
+        sim = torch.einsum("... h i d, ... h j d -> ... h i j", q, k)
 
         # relative positional bias
 
         if exists(pos_bias):
             sim = sim + pos_bias
 
-        if (focus_present_mask is None and video_mask is not None):
+        if focus_present_mask is None and video_mask is not None:
             # video_mask: [B, n]
             mask = video_mask[:, None, :] * video_mask[:, :, None]
             mask = mask.unsqueeze(1).unsqueeze(1)
             sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
         elif exists(focus_present_mask) and not (~focus_present_mask).all():
-            attend_all_mask = torch.ones((n, n),
-                                         device=device,
-                                         dtype=torch.bool)
+            attend_all_mask = torch.ones((n, n), device=device, dtype=torch.bool)
             attend_self_mask = torch.eye(n, device=device, dtype=torch.bool)
 
             mask = torch.where(
-                rearrange(focus_present_mask, 'b -> b 1 1 1 1'),
-                rearrange(attend_self_mask, 'i j -> 1 1 1 i j'),
-                rearrange(attend_all_mask, 'i j -> 1 1 1 i j'),
+                rearrange(focus_present_mask, "b -> b 1 1 1 1"),
+                rearrange(attend_self_mask, "i j -> 1 1 1 i j"),
+                rearrange(attend_all_mask, "i j -> 1 1 1 i j"),
             )
 
             sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
 
         if self.use_sim_mask:
-            sim_mask = torch.tril(
-                torch.ones((n, n), device=device, dtype=torch.bool),
-                diagonal=0)
+            sim_mask = torch.tril(torch.ones((n, n), device=device, dtype=torch.bool), diagonal=0)
             sim = sim.masked_fill(~sim_mask, -torch.finfo(sim.dtype).max)
 
         # numerical stability
@@ -848,11 +804,11 @@ class TemporalAttentionBlock(nn.Module):
 
         # aggregate values
 
-        out = torch.einsum('... h i j, ... h j d -> ... h i d', attn, v)
-        out = rearrange(out, '... h n d -> ... n (h d)')
+        out = torch.einsum("... h i j, ... h j d -> ... h i d", attn, v)
+        out = rearrange(out, "... h n d -> ... n (h d)")
         out = self.to_out(out)
 
-        out = rearrange(out, 'b (h w) f c -> b c f h w', h=height)
+        out = rearrange(out, "b (h w) f c -> b c f h w", h=height)
 
         if self.use_image_dataset:
             out = identity + 0 * out
@@ -870,18 +826,20 @@ class TemporalTransformer(nn.Module):
     Finally, reshape to image
     """
 
-    def __init__(self,
-                 in_channels,
-                 n_heads,
-                 d_head,
-                 depth=1,
-                 dropout=0.,
-                 context_dim=None,
-                 disable_self_attn=False,
-                 use_linear=False,
-                 use_checkpoint=True,
-                 only_self_att=True,
-                 multiply_zero=False):
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.0,
+        context_dim=None,
+        disable_self_attn=False,
+        use_linear=False,
+        use_checkpoint=True,
+        only_self_att=True,
+        multiply_zero=False,
+    ):
         super().__init__()
         self.multiply_zero = multiply_zero
         self.only_self_att = only_self_att
@@ -892,34 +850,28 @@ class TemporalTransformer(nn.Module):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = torch.nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         if not use_linear:
-            self.proj_in = nn.Conv1d(
-                in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
+            self.proj_in = nn.Conv1d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
         else:
             self.proj_in = nn.Linear(in_channels, inner_dim)
-            if self.use_adaptor:
-                self.adaptor_in = nn.Linear(frames, frames)
+            # if self.use_adaptor:
+            #     self.adaptor_in = nn.Linear(frames, frames)
 
-        self.transformer_blocks = nn.ModuleList([
-            BasicTransformerBlock(
-                inner_dim,
-                n_heads,
-                d_head,
-                dropout=dropout,
-                context_dim=context_dim[d],
-                checkpoint=use_checkpoint) for d in range(depth)
-        ])
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock(
+                    inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d], checkpoint=use_checkpoint
+                )
+                for d in range(depth)
+            ]
+        )
         if not use_linear:
-            self.proj_out = zero_module(
-                nn.Conv1d(
-                    inner_dim, in_channels, kernel_size=1, stride=1,
-                    padding=0))
+            self.proj_out = zero_module(nn.Conv1d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0))
         else:
             self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
-            if self.use_adaptor:
-                self.adaptor_out = nn.Linear(frames, frames)
+            # if self.use_adaptor:
+            #     self.adaptor_out = nn.Linear(frames, frames)
         self.use_linear = use_linear
 
     def forward(self, x, context=None):
@@ -933,46 +885,38 @@ class TemporalTransformer(nn.Module):
         x = self.norm(x)
 
         if not self.use_linear:
-            x = rearrange(x, 'b c f h w -> (b h w) c f').contiguous()
+            x = rearrange(x, "b c f h w -> (b h w) c f").contiguous()
             x = self.proj_in(x)
         # [16384, 16, 320]
         if self.use_linear:
-            x = rearrange(
-                x, 'b c f h w -> (b h w) f c').contiguous()
+            x = rearrange(x, "b c f h w -> (b h w) f c").contiguous()
             x = self.proj_in(x)
-            x = rearrange(
-                x, 'bhw f c -> bhw c f').contiguous()
+            x = rearrange(x, "bhw f c -> bhw c f").contiguous()
 
         if self.only_self_att:
-            x = rearrange(x, 'bhw c f -> bhw f c').contiguous()
+            x = rearrange(x, "bhw c f -> bhw f c").contiguous()
             for i, block in enumerate(self.transformer_blocks):
                 x = block(x)
-            x = rearrange(x, '(b hw) f c -> b hw f c', b=b).contiguous()
+            x = rearrange(x, "(b hw) f c -> b hw f c", b=b).contiguous()
         else:
-            x = rearrange(x, '(b hw) c f -> b hw f c', b=b).contiguous()
+            x = rearrange(x, "(b hw) c f -> b hw f c", b=b).contiguous()
             for i, block in enumerate(self.transformer_blocks):
-                context[i] = rearrange(
-                    context[i], '(b f) l con -> b f l con',
-                    f=self.frames).contiguous()
+                context[i] = rearrange(context[i], "(b f) l con -> b f l con", f=self.frames).contiguous()
                 # calculate each batch one by one (since number in shape could not greater then 65,535 for some package)
                 for j in range(b):
                     context_i_j = repeat(
-                        context[i][j],
-                        'f l con -> (f r) l con',
-                        r=(h * w) // self.frames,
-                        f=self.frames).contiguous()
+                        context[i][j], "f l con -> (f r) l con", r=(h * w) // self.frames, f=self.frames
+                    ).contiguous()
                     x[j] = block(x[j], context=context_i_j)
 
         if self.use_linear:
-            x = rearrange(x, 'b hw f c -> (b hw) f c').contiguous()
+            x = rearrange(x, "b hw f c -> (b hw) f c").contiguous()
             x = self.proj_out(x)
-            x = rearrange(
-                x, '(b h w) f c -> b c f h w', b=b, h=h, w=w).contiguous()
+            x = rearrange(x, "(b h w) f c -> b c f h w", b=b, h=h, w=w).contiguous()
         if not self.use_linear:
-            x = rearrange(x, 'b hw f c -> (b hw) c f').contiguous()
+            x = rearrange(x, "b hw f c -> (b hw) c f").contiguous()
             x = self.proj_out(x)
-            x = rearrange(
-                x, '(b h w) c f -> b c f h w', b=b, h=h, w=w).contiguous()
+            x = rearrange(x, "(b h w) c f -> b c f h w", b=b, h=h, w=w).contiguous()
 
         if self.multiply_zero:
             x = 0.0 * x + x_in
@@ -994,17 +938,14 @@ class TemporalAttentionMultiBlock(nn.Module):
         temporal_attn_times=1,
     ):
         super().__init__()
-        self.att_layers = nn.ModuleList([
-            TemporalAttentionBlock(dim, heads, dim_head, rotary_emb,
-                                   use_image_dataset, use_sim_mask)
-            for _ in range(temporal_attn_times)
-        ])
+        self.att_layers = nn.ModuleList(
+            [
+                TemporalAttentionBlock(dim, heads, dim_head, rotary_emb, use_image_dataset, use_sim_mask)
+                for _ in range(temporal_attn_times)
+            ]
+        )
 
-    def forward(self,
-                x,
-                pos_bias=None,
-                focus_present_mask=None,
-                video_mask=None):
+    def forward(self, x, pos_bias=None, focus_present_mask=None, video_mask=None):
         for layer in self.att_layers:
             x = layer(x, pos_bias, focus_present_mask, video_mask)
         return x
@@ -1012,11 +953,7 @@ class TemporalAttentionMultiBlock(nn.Module):
 
 class InitTemporalConvBlock(nn.Module):
 
-    def __init__(self,
-                 in_dim,
-                 out_dim=None,
-                 dropout=0.0,
-                 use_image_dataset=False):
+    def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
         super(InitTemporalConvBlock, self).__init__()
         if out_dim is None:
             out_dim = in_dim
@@ -1026,8 +963,11 @@ class InitTemporalConvBlock(nn.Module):
 
         # conv layers
         self.conv = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, out_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)),
+        )
 
         # zero out the last layer params,so the conv block is identity
         nn.init.zeros_(self.conv[-1].weight)
@@ -1045,11 +985,7 @@ class InitTemporalConvBlock(nn.Module):
 
 class TemporalConvBlock(nn.Module):
 
-    def __init__(self,
-                 in_dim,
-                 out_dim=None,
-                 dropout=0.0,
-                 use_image_dataset=False):
+    def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
         super(TemporalConvBlock, self).__init__()
         if out_dim is None:
             out_dim = in_dim
@@ -1059,11 +995,14 @@ class TemporalConvBlock(nn.Module):
 
         # conv layers
         self.conv1 = nn.Sequential(
-            nn.GroupNorm(32, in_dim), nn.SiLU(),
-            nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, in_dim), nn.SiLU(), nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding=(1, 0, 0))
+        )
         self.conv2 = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, out_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)),
+        )
 
         # zero out the last layer params,so the conv block is identity
         nn.init.zeros_(self.conv2[-1].weight)
@@ -1082,11 +1021,7 @@ class TemporalConvBlock(nn.Module):
 
 class TemporalConvBlock_v2(nn.Module):
 
-    def __init__(self,
-                 in_dim,
-                 out_dim=None,
-                 dropout=0.0,
-                 use_image_dataset=False):
+    def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
         super(TemporalConvBlock_v2, self).__init__()
         if out_dim is None:
             out_dim = in_dim
@@ -1096,17 +1031,26 @@ class TemporalConvBlock_v2(nn.Module):
 
         # conv layers
         self.conv1 = nn.Sequential(
-            nn.GroupNorm(32, in_dim), nn.SiLU(),
-            nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, in_dim), nn.SiLU(), nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding=(1, 0, 0))
+        )
         self.conv2 = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, out_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)),
+        )
         self.conv3 = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, out_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)),
+        )
         self.conv4 = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)))
+            nn.GroupNorm(32, out_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 0, 0)),
+        )
 
         # zero out the last layer params,so the conv block is identity
         nn.init.zeros_(self.conv4[-1].weight)
@@ -1128,27 +1072,29 @@ class TemporalConvBlock_v2(nn.Module):
 
 class Vid2VidSDUNet(nn.Module):
 
-    def __init__(self,
-                 in_dim=4,
-                 dim=320,
-                 y_dim=1024,
-                 context_dim=1024,
-                 out_dim=4,
-                 dim_mult=[1, 2, 4, 4],
-                 num_heads=8,
-                 head_dim=64,
-                 num_res_blocks=2,
-                 attn_scales=[1 / 1, 1 / 2, 1 / 4],
-                 use_scale_shift_norm=True,
-                 dropout=0.1,
-                 temporal_attn_times=1,
-                 temporal_attention=True,
-                 use_checkpoint=True,
-                 use_image_dataset=False,
-                 use_fps_condition=False,
-                 use_sim_mask=False,
-                 training=False,
-                 inpainting=True):
+    def __init__(
+        self,
+        in_dim=4,
+        dim=320,
+        y_dim=1024,
+        context_dim=1024,
+        out_dim=4,
+        dim_mult=[1, 2, 4, 4],
+        num_heads=8,
+        head_dim=64,
+        num_res_blocks=2,
+        attn_scales=[1 / 1, 1 / 2, 1 / 4],
+        use_scale_shift_norm=True,
+        dropout=0.1,
+        temporal_attn_times=1,
+        temporal_attention=True,
+        use_checkpoint=True,
+        use_image_dataset=False,
+        use_fps_condition=False,
+        use_sim_mask=False,
+        training=False,
+        inpainting=True,
+    ):
         embed_dim = dim * 4
         num_heads = num_heads if num_heads else dim // 32
         super(Vid2VidSDUNet, self).__init__()
@@ -1185,14 +1131,10 @@ class Vid2VidSDUNet(nn.Module):
         scale = 1.0
 
         # embeddings
-        self.time_embed = nn.Sequential(
-            nn.Linear(dim, embed_dim), nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim))
+        self.time_embed = nn.Sequential(nn.Linear(dim, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
 
         if self.use_fps_condition:
-            self.fps_embedding = nn.Sequential(
-                nn.Linear(dim, embed_dim), nn.SiLU(),
-                nn.Linear(embed_dim, embed_dim))
+            self.fps_embedding = nn.Sequential(nn.Linear(dim, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
             nn.init.zeros_(self.fps_embedding[-1].weight)
             nn.init.zeros_(self.fps_embedding[-1].bias)
 
@@ -1211,7 +1153,9 @@ class Vid2VidSDUNet(nn.Module):
                         context_dim=context_dim,
                         disable_self_attn=disabled_sa,
                         use_linear=use_linear_in_temporal,
-                        multiply_zero=use_image_dataset))
+                        multiply_zero=use_image_dataset,
+                    )
+                )
             else:
                 init_block.append(
                     TemporalAttentionMultiBlock(
@@ -1220,22 +1164,25 @@ class Vid2VidSDUNet(nn.Module):
                         head_dim,
                         rotary_emb=self.rotary_emb,
                         temporal_attn_times=temporal_attn_times,
-                        use_image_dataset=use_image_dataset))
-        self.input_blocks.append(init_block)
-        shortcut_dims.append(dim)
-        for i, (in_dim,
-                out_dim) in enumerate(zip(enc_dims[:-1], enc_dims[1:])):
-            for j in range(num_res_blocks):
-                block = nn.ModuleList([
-                    ResBlock(
-                        in_dim,
-                        embed_dim,
-                        dropout,
-                        out_channels=out_dim,
-                        use_scale_shift_norm=False,
                         use_image_dataset=use_image_dataset,
                     )
-                ])
+                )
+        self.input_blocks.append(init_block)
+        shortcut_dims.append(dim)
+        for i, (in_dim, out_dim) in enumerate(zip(enc_dims[:-1], enc_dims[1:])):
+            for j in range(num_res_blocks):
+                block = nn.ModuleList(
+                    [
+                        ResBlock(
+                            in_dim,
+                            embed_dim,
+                            dropout,
+                            out_channels=out_dim,
+                            use_scale_shift_norm=False,
+                            use_image_dataset=use_image_dataset,
+                        )
+                    ]
+                )
                 if scale in attn_scales:
                     block.append(
                         SpatialTransformer(
@@ -1245,7 +1192,9 @@ class Vid2VidSDUNet(nn.Module):
                             depth=1,
                             context_dim=self.context_dim,
                             disable_self_attn=False,
-                            use_linear=True))
+                            use_linear=True,
+                        )
+                    )
                     if self.temporal_attention:
                         if USE_TEMPORAL_TRANSFORMER:
                             block.append(
@@ -1257,7 +1206,9 @@ class Vid2VidSDUNet(nn.Module):
                                     context_dim=context_dim,
                                     disable_self_attn=disabled_sa,
                                     use_linear=use_linear_in_temporal,
-                                    multiply_zero=use_image_dataset))
+                                    multiply_zero=use_image_dataset,
+                                )
+                            )
                         else:
                             block.append(
                                 TemporalAttentionMultiBlock(
@@ -1267,36 +1218,40 @@ class Vid2VidSDUNet(nn.Module):
                                     rotary_emb=self.rotary_emb,
                                     use_image_dataset=use_image_dataset,
                                     use_sim_mask=use_sim_mask,
-                                    temporal_attn_times=temporal_attn_times))
+                                    temporal_attn_times=temporal_attn_times,
+                                )
+                            )
                 in_dim = out_dim
                 self.input_blocks.append(block)
                 shortcut_dims.append(out_dim)
 
                 # downsample
                 if i != len(dim_mult) - 1 and j == num_res_blocks - 1:
-                    downsample = Downsample(
-                        out_dim, True, dims=2, out_channels=out_dim)
+                    downsample = Downsample(out_dim, True, dims=2, out_channels=out_dim)
                     shortcut_dims.append(out_dim)
                     scale /= 2.0
                     self.input_blocks.append(downsample)
 
-        self.middle_block = nn.ModuleList([
-            ResBlock(
-                out_dim,
-                embed_dim,
-                dropout,
-                use_scale_shift_norm=False,
-                use_image_dataset=use_image_dataset,
-            ),
-            SpatialTransformer(
-                out_dim,
-                out_dim // head_dim,
-                head_dim,
-                depth=1,
-                context_dim=self.context_dim,
-                disable_self_attn=False,
-                use_linear=True)
-        ])
+        self.middle_block = nn.ModuleList(
+            [
+                ResBlock(
+                    out_dim,
+                    embed_dim,
+                    dropout,
+                    use_scale_shift_norm=False,
+                    use_image_dataset=use_image_dataset,
+                ),
+                SpatialTransformer(
+                    out_dim,
+                    out_dim // head_dim,
+                    head_dim,
+                    depth=1,
+                    context_dim=self.context_dim,
+                    disable_self_attn=False,
+                    use_linear=True,
+                ),
+            ]
+        )
 
         if self.temporal_attention:
             if USE_TEMPORAL_TRANSFORMER:
@@ -1310,7 +1265,8 @@ class Vid2VidSDUNet(nn.Module):
                         disable_self_attn=disabled_sa,
                         use_linear=use_linear_in_temporal,
                         multiply_zero=use_image_dataset,
-                    ))
+                    )
+                )
             else:
                 self.middle_block.append(
                     TemporalAttentionMultiBlock(
@@ -1320,26 +1276,28 @@ class Vid2VidSDUNet(nn.Module):
                         rotary_emb=self.rotary_emb,
                         use_image_dataset=use_image_dataset,
                         use_sim_mask=use_sim_mask,
-                        temporal_attn_times=temporal_attn_times))
+                        temporal_attn_times=temporal_attn_times,
+                    )
+                )
 
-        self.middle_block.append(
-            ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False))
+        self.middle_block.append(ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False))
 
         # decoder
         self.output_blocks = nn.ModuleList()
-        for i, (in_dim,
-                out_dim) in enumerate(zip(dec_dims[:-1], dec_dims[1:])):
+        for i, (in_dim, out_dim) in enumerate(zip(dec_dims[:-1], dec_dims[1:])):
             for j in range(num_res_blocks + 1):
-                block = nn.ModuleList([
-                    ResBlock(
-                        in_dim + shortcut_dims.pop(),
-                        embed_dim,
-                        dropout,
-                        out_dim,
-                        use_scale_shift_norm=False,
-                        use_image_dataset=use_image_dataset,
-                    )
-                ])
+                block = nn.ModuleList(
+                    [
+                        ResBlock(
+                            in_dim + shortcut_dims.pop(),
+                            embed_dim,
+                            dropout,
+                            out_dim,
+                            use_scale_shift_norm=False,
+                            use_image_dataset=use_image_dataset,
+                        )
+                    ]
+                )
                 if scale in attn_scales:
                     block.append(
                         SpatialTransformer(
@@ -1349,7 +1307,9 @@ class Vid2VidSDUNet(nn.Module):
                             depth=1,
                             context_dim=1024,
                             disable_self_attn=False,
-                            use_linear=True))
+                            use_linear=True,
+                        )
+                    )
                     if self.temporal_attention:
                         if USE_TEMPORAL_TRANSFORMER:
                             block.append(
@@ -1361,7 +1321,9 @@ class Vid2VidSDUNet(nn.Module):
                                     context_dim=context_dim,
                                     disable_self_attn=disabled_sa,
                                     use_linear=use_linear_in_temporal,
-                                    multiply_zero=use_image_dataset))
+                                    multiply_zero=use_image_dataset,
+                                )
+                            )
                         else:
                             block.append(
                                 TemporalAttentionMultiBlock(
@@ -1371,35 +1333,36 @@ class Vid2VidSDUNet(nn.Module):
                                     rotary_emb=self.rotary_emb,
                                     use_image_dataset=use_image_dataset,
                                     use_sim_mask=use_sim_mask,
-                                    temporal_attn_times=temporal_attn_times))
+                                    temporal_attn_times=temporal_attn_times,
+                                )
+                            )
                 in_dim = out_dim
 
                 # upsample
                 if i != len(dim_mult) - 1 and j == num_res_blocks:
-                    upsample = Upsample(
-                        out_dim, True, dims=2.0, out_channels=out_dim)
+                    upsample = Upsample(out_dim, True, dims=2.0, out_channels=out_dim)
                     scale *= 2.0
                     block.append(upsample)
                 self.output_blocks.append(block)
 
         # head
-        self.out = nn.Sequential(
-            nn.GroupNorm(32, out_dim), nn.SiLU(),
-            nn.Conv2d(out_dim, self.out_dim, 3, padding=1))
+        self.out = nn.Sequential(nn.GroupNorm(32, out_dim), nn.SiLU(), nn.Conv2d(out_dim, self.out_dim, 3, padding=1))
 
         # zero out the last layer params
         nn.init.zeros_(self.out[-1].weight)
 
-    def forward(self,
-                x,
-                t,
-                y,
-                x_lr=None,
-                fps=None,
-                video_mask=None,
-                focus_present_mask=None,
-                prob_focus_present=0.,
-                mask_last_frame_num=0):
+    def forward(
+        self,
+        x,
+        t,
+        y,
+        x_lr=None,
+        fps=None,
+        video_mask=None,
+        focus_present_mask=None,
+        prob_focus_present=0.0,
+        mask_last_frame_num=0,
+    ):
 
         batch, c, f, h, w = x.shape
         device = x.device
@@ -1411,12 +1374,11 @@ class Vid2VidSDUNet(nn.Module):
             video_mask[-mask_last_frame_num:] = False
         else:
             focus_present_mask = default(
-                focus_present_mask, lambda: prob_mask_like(
-                    (batch, ), prob_focus_present, device=device))
+                focus_present_mask, lambda: prob_mask_like((batch,), prob_focus_present, device=device)
+            )
 
         if self.temporal_attention and not USE_TEMPORAL_TRANSFORMER:
-            time_rel_pos_bias = self.time_rel_pos_bias(
-                x.shape[2], device=x.device)
+            time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
         else:
             time_rel_pos_bias = None
 
@@ -1429,18 +1391,16 @@ class Vid2VidSDUNet(nn.Module):
         context = context.repeat_interleave(repeats=f, dim=0)
 
         # always in shape (b f) c h w, except for temporal layer
-        x = rearrange(x, 'b c f h w -> (b f) c h w')
+        x = rearrange(x, "b c f h w -> (b f) c h w")
         # encoder
         xs = []
         for ind, block in enumerate(self.input_blocks):
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,
-                                     focus_present_mask, video_mask)
+            x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
             xs.append(x)
 
         # middle
         for block in self.middle_block:
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,
-                                     focus_present_mask, video_mask)
+            x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
 
         # decoder
         for block in self.output_blocks:
@@ -1453,55 +1413,43 @@ class Vid2VidSDUNet(nn.Module):
                 time_rel_pos_bias,
                 focus_present_mask,
                 video_mask,
-                reference=xs[-1] if len(xs) > 0 else None)
+                reference=xs[-1] if len(xs) > 0 else None,
+            )
 
         # head
         x = self.out(x)
 
         # reshape back to (b c f h w)
-        x = rearrange(x, '(b f) c h w -> b c f h w', b=batch)
+        x = rearrange(x, "(b f) c h w -> b c f h w", b=batch)
         return x
 
-    def _forward_single(self,
-                        module,
-                        x,
-                        e,
-                        context,
-                        time_rel_pos_bias,
-                        focus_present_mask,
-                        video_mask,
-                        reference=None):
+    def _forward_single(
+        self, module, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference=None
+    ):
         if isinstance(module, ResidualBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = x.contiguous()
             x = module(x, e, reference)
         elif isinstance(module, ResBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = x.contiguous()
             x = module(x, e, self.batch)
         elif isinstance(module, SpatialTransformer):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, TemporalTransformer):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, context)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, CrossAttention):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, MemoryEfficientCrossAttention):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, BasicTransformerBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, FeedForward):
             x = module(x, context)
@@ -1512,34 +1460,30 @@ class Vid2VidSDUNet(nn.Module):
         elif isinstance(module, Resample):
             x = module(x, reference)
         elif isinstance(module, TemporalAttentionBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, TemporalAttentionMultiBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, InitTemporalConvBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, TemporalConvBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, nn.ModuleList):
             for block in module:
-                x = self._forward_single(block, x, e, context,
-                                         time_rel_pos_bias, focus_present_mask,
-                                         video_mask, reference)
+                x = self._forward_single(
+                    block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference
+                )
         else:
             x = module(x)
         return x
@@ -1550,28 +1494,28 @@ class ControlledV2VUNet(Vid2VidSDUNet):
         super(ControlledV2VUNet, self).__init__()
         self.VideoControlNet = VideoControlNet()
 
-    def forward(self,
-                x,
-                t,
-                y,
-                hint=None,
-                t_hint=None,
-                s_cond=None,
-                mask_cond=None,
-                x_lr=None,
-                fps=None,
-                video_mask=None,
-                focus_present_mask=None,
-                prob_focus_present=0.,
-                mask_last_frame_num=0,
-                ):
-        
-        batch, c, f, h, w= x.shape
+    def forward(
+        self,
+        x,
+        t,
+        y,
+        hint=None,
+        t_hint=None,
+        s_cond=None,
+        mask_cond=None,
+        x_lr=None,
+        fps=None,
+        video_mask=None,
+        focus_present_mask=None,
+        prob_focus_present=0.0,
+        mask_last_frame_num=0,
+    ):
+
+        batch, c, f, h, w = x.shape
         device = x.device
         self.batch = batch
 
-        control = self.VideoControlNet(x, t, y, hint=hint, t_hint=t_hint, \
-                                                mask_cond=mask_cond, s_cond=s_cond)
+        control = self.VideoControlNet(x, t, y, hint=hint, t_hint=t_hint, mask_cond=mask_cond, s_cond=s_cond)
 
         # image and video joint training, if mask_last_frame_num is set, prob_focus_present will be ignored
         if mask_last_frame_num > 0:
@@ -1579,34 +1523,31 @@ class ControlledV2VUNet(Vid2VidSDUNet):
             video_mask[-mask_last_frame_num:] = False
         else:
             focus_present_mask = default(
-                focus_present_mask, lambda: prob_mask_like(
-                    (batch, ), prob_focus_present, device=device))
+                focus_present_mask, lambda: prob_mask_like((batch,), prob_focus_present, device=device)
+            )
 
         if self.temporal_attention and not USE_TEMPORAL_TRANSFORMER:
-            time_rel_pos_bias = self.time_rel_pos_bias(
-                x.shape[2], device=x.device)
+            time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
         else:
             time_rel_pos_bias = None
 
-        e = self.time_embed(sinusoidal_embedding(t, self.dim)) 
+        e = self.time_embed(sinusoidal_embedding(t, self.dim))
         e = e.repeat_interleave(repeats=f, dim=0)
 
         context = y
         context = context.repeat_interleave(repeats=f, dim=0)
 
         # always in shape (b f) c h w, except for temporal layer
-        x = rearrange(x, 'b c f h w -> (b f) c h w')
+        x = rearrange(x, "b c f h w -> (b f) c h w")
         # encoder
         xs = []
         for block in self.input_blocks:
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,
-                                    focus_present_mask, video_mask)
+            x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
             xs.append(x)
         # middle
         for block in self.middle_block:
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,
-                                    focus_present_mask, video_mask)
-            
+            x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
+
         if control is not None:
             x = control.pop() + x
 
@@ -1624,55 +1565,43 @@ class ControlledV2VUNet(Vid2VidSDUNet):
                 time_rel_pos_bias,
                 focus_present_mask,
                 video_mask,
-                reference=xs[-1] if len(xs) > 0 else None)
+                reference=xs[-1] if len(xs) > 0 else None,
+            )
 
         # head
         x = self.out(x)
 
         # reshape back to (b c f h w)
-        x = rearrange(x, '(b f) c h w -> b c f h w', b=batch)
+        x = rearrange(x, "(b f) c h w -> b c f h w", b=batch)
         return x
 
-    def _forward_single(self,
-                        module,
-                        x,
-                        e,
-                        context,
-                        time_rel_pos_bias,
-                        focus_present_mask,
-                        video_mask,
-                        reference=None):
+    def _forward_single(
+        self, module, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference=None
+    ):
         if isinstance(module, ResidualBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = x.contiguous()
             x = module(x, e, reference)
         elif isinstance(module, ResBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = x.contiguous()
             x = module(x, e, self.batch)
         elif isinstance(module, SpatialTransformer):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, TemporalTransformer):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, context)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, CrossAttention):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, MemoryEfficientCrossAttention):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, BasicTransformerBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, FeedForward):
             x = module(x, context)
@@ -1683,34 +1612,30 @@ class ControlledV2VUNet(Vid2VidSDUNet):
         elif isinstance(module, Resample):
             x = module(x, reference)
         elif isinstance(module, TemporalAttentionBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, TemporalAttentionMultiBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, InitTemporalConvBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, TemporalConvBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, nn.ModuleList):
             for block in module:
-                x = self._forward_single(block, x, e, context,
-                                         time_rel_pos_bias, focus_present_mask,
-                                         video_mask, reference)
+                x = self._forward_single(
+                    block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference
+                )
         else:
             x = module(x)
         return x
@@ -1718,27 +1643,29 @@ class ControlledV2VUNet(Vid2VidSDUNet):
 
 class VideoControlNet(nn.Module):
 
-    def __init__(self,
-                 in_dim=4,
-                 dim=320,
-                 y_dim=1024,
-                 context_dim=1024,
-                 out_dim=4,
-                 dim_mult=[1, 2, 4, 4],
-                 num_heads=8,
-                 head_dim=64,
-                 num_res_blocks=2,
-                 attn_scales=[1 / 1, 1 / 2, 1 / 4],
-                 use_scale_shift_norm=True,
-                 dropout=0.1,
-                 temporal_attn_times=1,
-                 temporal_attention=True,
-                 use_checkpoint=True,
-                 use_image_dataset=False,
-                 use_fps_condition=False,
-                 use_sim_mask=False,
-                 training=False,
-                 inpainting=True):
+    def __init__(
+        self,
+        in_dim=4,
+        dim=320,
+        y_dim=1024,
+        context_dim=1024,
+        out_dim=4,
+        dim_mult=[1, 2, 4, 4],
+        num_heads=8,
+        head_dim=64,
+        num_res_blocks=2,
+        attn_scales=[1 / 1, 1 / 2, 1 / 4],
+        use_scale_shift_norm=True,
+        dropout=0.1,
+        temporal_attn_times=1,
+        temporal_attention=True,
+        use_checkpoint=True,
+        use_image_dataset=False,
+        use_fps_condition=False,
+        use_sim_mask=False,
+        training=False,
+        inpainting=True,
+    ):
         embed_dim = dim * 4
         num_heads = num_heads if num_heads else dim // 32
         super(VideoControlNet, self).__init__()
@@ -1775,21 +1702,17 @@ class VideoControlNet(nn.Module):
         scale = 1.0
 
         # embeddings
-        self.time_embed = nn.Sequential(
-            nn.Linear(dim, embed_dim), nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim))
-        
+        self.time_embed = nn.Sequential(nn.Linear(dim, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
+
         self.hint_time_zero_linear = zero_module(nn.Linear(embed_dim, embed_dim))
 
         # scale prompt
         self.scale_cond = nn.Sequential(
-            nn.Linear(dim, embed_dim), nn.SiLU(),
-            zero_module(nn.Linear(embed_dim, embed_dim)))
+            nn.Linear(dim, embed_dim), nn.SiLU(), zero_module(nn.Linear(embed_dim, embed_dim))
+        )
 
         if self.use_fps_condition:
-            self.fps_embedding = nn.Sequential(
-                nn.Linear(dim, embed_dim), nn.SiLU(),
-                nn.Linear(embed_dim, embed_dim))
+            self.fps_embedding = nn.Sequential(nn.Linear(dim, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
             nn.init.zeros_(self.fps_embedding[-1].weight)
             nn.init.zeros_(self.fps_embedding[-1].bias)
 
@@ -1808,7 +1731,9 @@ class VideoControlNet(nn.Module):
                         context_dim=context_dim,
                         disable_self_attn=disabled_sa,
                         use_linear=use_linear_in_temporal,
-                        multiply_zero=use_image_dataset))
+                        multiply_zero=use_image_dataset,
+                    )
+                )
             else:
                 init_block.append(
                     TemporalAttentionMultiBlock(
@@ -1817,23 +1742,26 @@ class VideoControlNet(nn.Module):
                         head_dim,
                         rotary_emb=self.rotary_emb,
                         temporal_attn_times=temporal_attn_times,
-                        use_image_dataset=use_image_dataset))
+                        use_image_dataset=use_image_dataset,
+                    )
+                )
         self.input_blocks.append(init_block)
         self.zero_convs = nn.ModuleList([self.make_zero_conv(dim)])
         shortcut_dims.append(dim)
-        for i, (in_dim,
-                out_dim) in enumerate(zip(enc_dims[:-1], enc_dims[1:])):
+        for i, (in_dim, out_dim) in enumerate(zip(enc_dims[:-1], enc_dims[1:])):
             for j in range(num_res_blocks):
-                block = nn.ModuleList([
-                    ResBlock(
-                        in_dim,
-                        embed_dim,
-                        dropout,
-                        out_channels=out_dim,
-                        use_scale_shift_norm=False,
-                        use_image_dataset=use_image_dataset,
-                    )
-                ])
+                block = nn.ModuleList(
+                    [
+                        ResBlock(
+                            in_dim,
+                            embed_dim,
+                            dropout,
+                            out_channels=out_dim,
+                            use_scale_shift_norm=False,
+                            use_image_dataset=use_image_dataset,
+                        )
+                    ]
+                )
                 if scale in attn_scales:
                     block.append(
                         SpatialTransformer(
@@ -1843,7 +1771,9 @@ class VideoControlNet(nn.Module):
                             depth=1,
                             context_dim=self.context_dim,
                             disable_self_attn=False,
-                            use_linear=True))
+                            use_linear=True,
+                        )
+                    )
                     if self.temporal_attention:
                         if USE_TEMPORAL_TRANSFORMER:
                             block.append(
@@ -1855,7 +1785,9 @@ class VideoControlNet(nn.Module):
                                     context_dim=context_dim,
                                     disable_self_attn=disabled_sa,
                                     use_linear=use_linear_in_temporal,
-                                    multiply_zero=use_image_dataset))
+                                    multiply_zero=use_image_dataset,
+                                )
+                            )
                         else:
                             block.append(
                                 TemporalAttentionMultiBlock(
@@ -1865,38 +1797,42 @@ class VideoControlNet(nn.Module):
                                     rotary_emb=self.rotary_emb,
                                     use_image_dataset=use_image_dataset,
                                     use_sim_mask=use_sim_mask,
-                                    temporal_attn_times=temporal_attn_times))
+                                    temporal_attn_times=temporal_attn_times,
+                                )
+                            )
                 in_dim = out_dim
                 self.input_blocks.append(block)
-                self.zero_convs.append(self.make_zero_conv(out_dim)) 
+                self.zero_convs.append(self.make_zero_conv(out_dim))
                 shortcut_dims.append(out_dim)
 
                 # downsample
                 if i != len(dim_mult) - 1 and j == num_res_blocks - 1:
-                    downsample = Downsample(
-                        out_dim, True, dims=2, out_channels=out_dim)
+                    downsample = Downsample(out_dim, True, dims=2, out_channels=out_dim)
                     shortcut_dims.append(out_dim)
                     scale /= 2.0
                     self.input_blocks.append(downsample)
-                    self.zero_convs.append(self.make_zero_conv(out_dim)) 
+                    self.zero_convs.append(self.make_zero_conv(out_dim))
 
-        self.middle_block = nn.ModuleList([
-            ResBlock(
-                out_dim,
-                embed_dim,
-                dropout,
-                use_scale_shift_norm=False,
-                use_image_dataset=use_image_dataset,
-            ),
-            SpatialTransformer(
-                out_dim,
-                out_dim // head_dim,
-                head_dim,
-                depth=1,
-                context_dim=self.context_dim,
-                disable_self_attn=False,
-                use_linear=True)
-        ])
+        self.middle_block = nn.ModuleList(
+            [
+                ResBlock(
+                    out_dim,
+                    embed_dim,
+                    dropout,
+                    use_scale_shift_norm=False,
+                    use_image_dataset=use_image_dataset,
+                ),
+                SpatialTransformer(
+                    out_dim,
+                    out_dim // head_dim,
+                    head_dim,
+                    depth=1,
+                    context_dim=self.context_dim,
+                    disable_self_attn=False,
+                    use_linear=True,
+                ),
+            ]
+        )
 
         if self.temporal_attention:
             if USE_TEMPORAL_TRANSFORMER:
@@ -1910,7 +1846,8 @@ class VideoControlNet(nn.Module):
                         disable_self_attn=disabled_sa,
                         use_linear=use_linear_in_temporal,
                         multiply_zero=use_image_dataset,
-                    ))
+                    )
+                )
             else:
                 self.middle_block.append(
                     TemporalAttentionMultiBlock(
@@ -1920,16 +1857,17 @@ class VideoControlNet(nn.Module):
                         rotary_emb=self.rotary_emb,
                         use_image_dataset=use_image_dataset,
                         use_sim_mask=use_sim_mask,
-                        temporal_attn_times=temporal_attn_times))
+                        temporal_attn_times=temporal_attn_times,
+                    )
+                )
 
-        self.middle_block.append(
-            ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False))
-        
+        self.middle_block.append(ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False))
+
         self.middle_block_out = self.make_zero_conv(embed_dim)
 
-        '''
+        """
         add prompt
-        '''
+        """
         add_dim = 320
         self.add_dim = add_dim
 
@@ -1939,19 +1877,21 @@ class VideoControlNet(nn.Module):
         out_channels = in_channels if out_channels is None else out_channels
         return TimestepEmbedSequential(zero_module(nn.Conv2d(in_channels, out_channels, 1, padding=0)))
 
-    def forward(self,
-                x,
-                t,
-                y,
-                s_cond=None,
-                hint=None,
-                t_hint=None,
-                mask_cond=None,
-                fps=None,
-                video_mask=None,
-                focus_present_mask=None,
-                prob_focus_present=0.,
-                mask_last_frame_num=0):
+    def forward(
+        self,
+        x,
+        t,
+        y,
+        s_cond=None,
+        hint=None,
+        t_hint=None,
+        mask_cond=None,
+        fps=None,
+        video_mask=None,
+        focus_present_mask=None,
+        prob_focus_present=0.0,
+        mask_last_frame_num=0,
+    ):
 
         batch, x_c, f, h, w = x.shape
         device = x.device
@@ -1963,128 +1903,111 @@ class VideoControlNet(nn.Module):
             video_mask[-mask_last_frame_num:] = False
         else:
             focus_present_mask = default(
-                focus_present_mask, lambda: prob_mask_like(
-                    (batch, ), prob_focus_present, device=device))
+                focus_present_mask, lambda: prob_mask_like((batch,), prob_focus_present, device=device)
+            )
 
         if self.temporal_attention and not USE_TEMPORAL_TRANSFORMER:
-            time_rel_pos_bias = self.time_rel_pos_bias(
-                x.shape[2], device=x.device)
+            time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
         else:
             time_rel_pos_bias = None
 
         if hint is not None:
             add = x.new_zeros(batch, self.add_dim, f, h, w)
-            hints = rearrange(hint, 'b c f h w -> (b f) c h w')
+            hints = rearrange(hint, "b c f h w -> (b f) c h w")
             hints = self.input_hint_block(hints)
-            hints = rearrange(hints, '(b f) c h w -> b c f h w', b = batch)
+            hints = rearrange(hints, "(b f) c h w -> b c f h w", b=batch)
 
             if mask_cond is not None:
                 for i in range(batch):
                     mask_cond_per_batch = mask_cond[i]
                     inds = torch.where(mask_cond_per_batch >= 0)[0]
                     hint_inds = mask_cond_per_batch[inds]
-                    add[i,:,inds] += hints[i,:,hint_inds]
+                    add[i, :, inds] += hints[i, :, hint_inds]
                     # add[i,:,inds] += hints[i]
-            add = rearrange(add, 'b c f h w -> (b f) c h w')
+            add = rearrange(add, "b c f h w -> (b f) c h w")
 
-        e = self.time_embed(sinusoidal_embedding(t, self.dim)) 
+        e = self.time_embed(sinusoidal_embedding(t, self.dim))
         e = e.repeat_interleave(repeats=f, dim=0)
 
         if t_hint is not None:
             e_cond = self.hint_time_zero_linear(self.time_embed(sinusoidal_embedding(t_hint, self.dim)))
             if mask_cond is not None:
-                e = rearrange(e, '(b f) d -> b f d', b=batch)
+                e = rearrange(e, "(b f) d -> b f d", b=batch)
                 for i in range(batch):
                     mask_cond_per_batch = mask_cond[i]
                     inds = torch.where(mask_cond_per_batch >= 0)[0]
-                    e[i,inds] += e_cond[i]
-                e = rearrange(e, 'b f d -> (b f) d')
+                    e[i, inds] += e_cond[i]
+                e = rearrange(e, "b f d -> (b f) d")
             else:
                 e_cond = e_cond.repeat_interleave(repeats=f, dim=0)
                 e += e_cond
-        
+
         if s_cond is not None:
-            e_scale = self.scale_cond(sinusoidal_embedding(s_cond, self.dim)) 
+            e_scale = self.scale_cond(sinusoidal_embedding(s_cond, self.dim))
             if mask_cond is not None:
-                e = rearrange(e, '(b f) d -> b f d', b=batch)
+                e = rearrange(e, "(b f) d -> b f d", b=batch)
                 for i in range(batch):
                     mask_cond_per_batch = mask_cond[i]
                     inds = torch.where(mask_cond_per_batch >= 0)[0]
-                    e[i,inds] += e_scale[i]
-                e = rearrange(e, 'b f d -> (b f) d')
+                    e[i, inds] += e_scale[i]
+                e = rearrange(e, "b f d -> (b f) d")
             else:
                 e_scale = e_scale.repeat_interleave(repeats=f, dim=0)
                 e += e_scale
-        
+
         context = y.repeat_interleave(repeats=f, dim=0)
 
         # always in shape (b f) c h w, except for temporal layer
-        x = rearrange(x, 'b c f h w -> (b f) c h w')
+        x = rearrange(x, "b c f h w -> (b f) c h w")
 
         # encoder
         xs = []
         for module, zero_conv in zip(self.input_blocks, self.zero_convs):
             if hint is not None:
                 for block in module:
-                    x = self._forward_single(block, x, e, context, time_rel_pos_bias,
-                                        focus_present_mask, video_mask)
+                    x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
                     if not isinstance(block, TemporalTransformer):
                         if hint is not None:
                             x += add
                             hint = None
             else:
-                x = self._forward_single(module, x, e, context, time_rel_pos_bias,
-                                        focus_present_mask, video_mask)
+                x = self._forward_single(module, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
             xs.append(zero_conv(x, e, context))
 
         # middle
         for block in self.middle_block:
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,
-                                     focus_present_mask, video_mask)
+            x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
         xs.append(self.middle_block_out(x, e, context))
-       
+
         return xs
 
-    def _forward_single(self,
-                        module,
-                        x,
-                        e,
-                        context,
-                        time_rel_pos_bias,
-                        focus_present_mask,
-                        video_mask,
-                        reference=None):
+    def _forward_single(
+        self, module, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference=None
+    ):
         if isinstance(module, ResidualBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = x.contiguous()
             x = module(x, e, reference)
         elif isinstance(module, ResBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = x.contiguous()
             x = module(x, e, self.batch)
         elif isinstance(module, SpatialTransformer):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, TemporalTransformer):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, context)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, CrossAttention):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, MemoryEfficientCrossAttention):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, BasicTransformerBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, FeedForward):
             x = module(x, context)
@@ -2095,34 +2018,30 @@ class VideoControlNet(nn.Module):
         elif isinstance(module, Resample):
             x = module(x, reference)
         elif isinstance(module, TemporalAttentionBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, TemporalAttentionMultiBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, InitTemporalConvBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, TemporalConvBlock):
-            module = checkpoint_wrapper(
-                module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b=self.batch)
+            module = checkpoint_wrapper(module) if self.use_checkpoint else module
+            x = rearrange(x, "(b f) c h w -> b c f h w", b=self.batch)
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            x = rearrange(x, "b c f h w -> (b f) c h w")
         elif isinstance(module, nn.ModuleList):
             for block in module:
-                x = self._forward_single(block, x, e, context,
-                                         time_rel_pos_bias, focus_present_mask,
-                                         video_mask, reference)
+                x = self._forward_single(
+                    block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference
+                )
         else:
             x = module(x)
         return x
@@ -2138,6 +2057,7 @@ class TimestepBlock(nn.Module):
         """
         Apply the module to `x` given `emb` timestep embeddings.
         """
+
 
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
